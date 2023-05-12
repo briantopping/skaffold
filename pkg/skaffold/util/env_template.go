@@ -28,6 +28,7 @@ import (
 	"text/template"
 
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/output/log"
+	"github.com/Masterminds/sprig"
 )
 
 // For testing
@@ -48,6 +49,31 @@ func ExpandEnvTemplate(s string, envMap map[string]string) (string, error) {
 	return ExecuteEnvTemplate(tmpl, envMap)
 }
 
+func ExpandEnvTemplateToList(s string, customMap map[string]string) (string, error) {
+	envTemplate, err := ParseEnvTemplate(s)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse template: %q: %w", s, err)
+	}
+	//return ExecuteEnvTemplate(tmpl, envMap)
+	envMap := map[string]string{}
+	for _, env := range OSEnviron() {
+		kvp := strings.SplitN(env, "=", 2)
+		envMap[kvp[0]] = kvp[1]
+	}
+
+	for k, v := range customMap {
+		envMap[k] = v
+	}
+
+	var buf bytes.Buffer
+	log.Entry(context.TODO()).Debugf("Executing template %v with environment %v", envTemplate, envMap)
+	if err := envTemplate.Execute(&buf, envMap); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+
+}
+
 // ExpandEnvTemplateOrFail parses and executes template s with an optional environment map, and errors if a reference cannot be satisfied.
 func ExpandEnvTemplateOrFail(s string, envMap map[string]string) (string, error) {
 	tmpl, err := ParseEnvTemplate(s)
@@ -60,7 +86,7 @@ func ExpandEnvTemplateOrFail(s string, envMap map[string]string) (string, error)
 
 // ParseEnvTemplate is a simple wrapper to parse an env template
 func ParseEnvTemplate(t string) (*template.Template, error) {
-	return template.New("envTemplate").Funcs(funcsMap).Parse(t)
+	return template.New("envTemplate").Funcs(funcsMap).Funcs(sprig.FuncMap()).Parse(t)
 }
 
 // ExecuteEnvTemplate executes an envTemplate based on OS environment variables and a custom map

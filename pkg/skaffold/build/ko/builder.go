@@ -25,6 +25,7 @@ import (
 	"github.com/google/ko/pkg/build"
 	"github.com/google/ko/pkg/commands"
 	"github.com/google/ko/pkg/commands/options"
+	"k8s.io/apimachinery/pkg/util/json"
 
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/config"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/platform"
@@ -145,7 +146,19 @@ func expand(dryValues []string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("could not expand %s", rawValue)
 		}
-		expandedValues = append(expandedValues, expandedValue)
+		parsed := parseString(expandedValue)
+		for _, v := range parsed {
+			expandedValues = append(expandedValues, fmt.Sprint(v))
+		}
 	}
 	return expandedValues, nil
+}
+
+func parseString(input string) []string {
+	var result []string
+	err := json.Unmarshal([]byte(input), &result)
+	if err != nil {
+		return append(result, input)
+	}
+	return result
 }
