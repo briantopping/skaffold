@@ -36,6 +36,7 @@ import (
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/kubectl"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/kubernetes/manifest"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/render"
+	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/render/applysetters"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/render/generate"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/render/renderer/util"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/render/transform"
@@ -57,6 +58,7 @@ type Kustomize struct {
 	labels            map[string]string
 	manifestOverrides map[string]string
 
+	applySetters       applysetters.ApplySetters
 	transformer        transform.Transformer
 	validator          validate.Validator
 	transformAllowlist map[apimachinery.GroupKind]latest.ResourceFilter
@@ -68,7 +70,16 @@ func (k Kustomize) Render(ctx context.Context, out io.Writer, builds []graph.Art
 	kCLI := kubectl.NewCLI(k.cfg, "")
 	useKubectlKustomize := !generate.KustomizeBinaryCheck() && generate.KubectlVersionCheck(kCLI)
 
-	for _, kustomizePath := range sUtil.AbsolutePaths(k.cfg.GetWorkingDir(), k.rCfg.Kustomize.Paths) {
+	var kustomizePaths []string
+	for _, kustomizePath := range k.rCfg.Kustomize.Paths {
+		kPath, err := sUtil.ExpandEnvTemplate(kustomizePath, nil)
+		if err != nil {
+			return manifest.ManifestListByConfig{}, fmt.Errorf("unable to parse path %q: %w", kustomizePath, err)
+		}
+		kustomizePaths = append(kustomizePaths, kPath)
+	}
+
+	for _, kustomizePath := range sUtil.AbsolutePaths(k.cfg.GetWorkingDir(), kustomizePaths) {
 		out, err := k.render(ctx, kustomizePath, useKubectlKustomize, kCLI)
 		if err != nil {
 			return manifest.ManifestListByConfig{}, err
@@ -106,13 +117,8 @@ func (k Kustomize) Render(ctx context.Context, out io.Writer, builds []graph.Art
 
 func (k Kustomize) render(ctx context.Context, kustomizePath string, useKubectlKustomize bool, kCLI *kubectl.CLI) ([]byte, error) {
 	var out []byte
-	var err error
-	kPath, err := sUtil.ExpandEnvTemplate(kustomizePath, nil)
-	if err != nil {
-		return out, fmt.Errorf("unable to parse path %q: %w", kustomizePath, err)
-	}
 
-	if !k.transformer.IsEmpty() && !sUtil.IsURL(kustomizePath) {
+	if (len(k.applySetters.Setters) > 0 || !k.transformer.IsEmpty()) && !sUtil.IsURL(kustomizePath) {
 		temp, err := os.MkdirTemp("", "*")
 		if err != nil {
 			return out, err
@@ -120,17 +126,17 @@ func (k Kustomize) render(ctx context.Context, kustomizePath string, useKubectlK
 		fs := newTmpFS(temp)
 		defer fs.Cleanup()
 
-		if err := k.mirror(kPath, fs); err == nil {
-			kPath = filepath.Join(temp, kPath)
+		if err := k.mirror(kustomizePath, fs); err == nil {
+			kustomizePath = filepath.Join(temp, kustomizePath)
 		} else {
 			return out, err
 		}
 	}
 
 	if useKubectlKustomize {
-		return kCLI.Kustomize(ctx, kustomizeBuildArgs(k.rCfg.Kustomize.BuildArgs, kPath))
+		return kCLI.Kustomize(ctx, kustomizeBuildArgs(k.rCfg.Kustomize.BuildArgs, kustomizePath))
 	} else {
-		cmd := exec.CommandContext(ctx, "kustomize", append([]string{"build"}, kustomizeBuildArgs(k.rCfg.Kustomize.BuildArgs, kPath)...)...)
+		cmd := exec.CommandContext(ctx, "kustomize", append([]string{"build"}, kustomizeBuildArgs(k.rCfg.Kustomize.BuildArgs, kustomizePath)...)...)
 		return sUtil.RunCmdOut(ctx, cmd)
 	}
 }
@@ -228,10 +234,10 @@ func New(cfg render.Config, rCfg latest.RenderConfig, labels map[string]string, 
 		}
 	}
 
+	var ass applysetters.ApplySetters
 	if len(manifestOverrides) > 0 {
-		err := transformer.Append(latest.Transformer{Name: "apply-setters", ConfigMap: sUtil.EnvMapToSlice(manifestOverrides, ":")})
-		if err != nil {
-			return Kustomize{}, err
+		for k, v := range manifestOverrides {
+			ass.Setters = append(ass.Setters, applysetters.Setter{Name: k, Value: v})
 		}
 	}
 
@@ -245,6 +251,7 @@ func New(cfg render.Config, rCfg latest.RenderConfig, labels map[string]string, 
 		manifestOverrides: manifestOverrides,
 		validator:         validator,
 		transformer:       transformer,
+		applySetters:      ass,
 
 		transformAllowlist: transformAllowlist,
 		transformDenylist:  transformDenylist,
@@ -306,6 +313,11 @@ func (k Kustomize) mirrorFile(kusDir string, fs TmpFS, path string) error {
 	err = k.transformer.TransformPath(fsPath)
 	if err != nil {
 		return err
+	}
+
+	err = k.applySetters.ApplyPath(fsPath)
+	if err != nil {
+		return fmt.Errorf("failed to apply setter to file %s, err: %v", pFile, err)
 	}
 	return nil
 }
@@ -467,12 +479,20 @@ func DependenciesForKustomization(dir string) ([]string, error) {
 
 	for _, patch := range content.Patches {
 		if patch.Path != "" {
+			local, _ := pathExistsLocally(patch.Path, dir)
+			if !local {
+				continue
+			}
 			deps = append(deps, filepath.Join(dir, patch.Path))
 		}
 	}
 
 	for _, jsonPatch := range content.PatchesJson6902 {
 		if jsonPatch.Path != "" {
+			local, _ := pathExistsLocally(jsonPatch.Path, dir)
+			if !local {
+				continue
+			}
 			deps = append(deps, filepath.Join(dir, jsonPatch.Path))
 		}
 	}

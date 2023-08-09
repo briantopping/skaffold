@@ -115,6 +115,10 @@ type Deployer struct {
 	transformableDenylist  map[apimachinery.GroupKind]latest.ResourceFilter
 }
 
+func (h Deployer) ManifestOverrides() map[string]string {
+	return map[string]string{}
+}
+
 func (h Deployer) EnableDebug() bool           { return h.enableDebug }
 func (h Deployer) OverrideProtocols() []string { return h.overrideProtocols }
 func (h Deployer) ConfigFile() string          { return h.configFile }
@@ -438,17 +442,19 @@ func (h *Deployer) deployRelease(ctx context.Context, out io.Writer, releaseName
 	}
 
 	installEnv := util.OSEnviron()
-	if len(builds) > 0 {
-		skaffoldBinary, filterEnv, cleanup, err := helm.PrepareSkaffoldFilter(h, builds)
-		if err != nil {
-			return nil, nil, fmt.Errorf("could not prepare `skaffold filter`: %w", err)
-		}
 
-		// need to include current environment, specifically for HOME to lookup ~/.kube/config
-		installEnv = append(installEnv, filterEnv...)
-		opts.postRenderer = skaffoldBinary
+	skaffoldBinary, filterEnv, cleanup, err := helm.PrepareSkaffoldFilter(h, builds)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not prepare `skaffold filter`: %w", err)
+	}
+
+	if cleanup != nil {
 		defer cleanup()
 	}
+	// need to include current environment, specifically for HOME to lookup ~/.kube/config
+	installEnv = append(installEnv, filterEnv...)
+	opts.postRenderer = skaffoldBinary
+
 	opts.namespace, err = helm.ReleaseNamespace(h.namespace, r)
 	if err != nil {
 		return nil, nil, err

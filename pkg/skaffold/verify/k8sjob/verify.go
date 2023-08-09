@@ -20,12 +20,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"sync"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/fatih/semgroup"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
@@ -33,9 +31,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/kubectl/pkg/scheme"
+	k8sclient "k8s.io/client-go/kubernetes"
 
 	component "github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/deploy/component/kubernetes"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/deploy/kubectl"
@@ -43,6 +40,7 @@ import (
 	eventV2 "github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/event/v2"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/graph"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/instrumentation"
+	k8sjobutil "github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/k8sjob"
 	k8sjoblogger "github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/k8sjob/logger"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/k8sjob/tracker"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/kubernetes"
@@ -63,7 +61,6 @@ type Verifier struct {
 	imageLoader      loader.ImageLoader
 	logger           *k8sjoblogger.Logger
 	statusMonitor    status.Monitor
-	originalImages   []graph.Artifact // the set of images parsed from the Verifier's manifest set
 	localImages      []graph.Artifact // the set of images marked as "local" by the Runner
 	kubectl          kubectl.CLI
 	labeller         *label.DefaultLabeller
@@ -82,14 +79,7 @@ func NewVerifier(ctx context.Context, cfg kubectl.Config, labeller *label.Defaul
 	tracker := tracker.NewContainerTracker()
 	logger := k8sjoblogger.NewLogger(ctx, tracker, labeller, kubectl.KubeContext)
 
-	var origImages []graph.Artifact
-	for _, artifact := range artifacts {
-		origImages = append(origImages, graph.Artifact{
-			ImageName: artifact.ImageName,
-		})
-	}
 	return &Verifier{
-		originalImages:   origImages,
 		cfg:              testCases,
 		defaultNamespace: defaultNamespace,
 		imageLoader:      component.NewImageLoader(cfg, kubectl.CLI),
@@ -137,7 +127,7 @@ func (v *Verifier) Verify(ctx context.Context, out io.Writer, allbuilds []graph.
 	}
 
 	childCtx, endTrace = instrumentation.StartTrace(ctx, "Verify_LoadImages")
-	if err := v.imageLoader.LoadImages(childCtx, out, v.localImages, v.originalImages, allbuilds); err != nil {
+	if err := v.imageLoader.LoadImages(childCtx, out, v.localImages, v.localImages, v.localImages); err != nil {
 		endTrace(instrumentation.TraceEndError(err))
 		return err
 	}
@@ -202,7 +192,7 @@ func (v *Verifier) createAndRunJob(ctx context.Context, tc latest.VerifyTestCase
 		job = v.createJob(tc.Name, tc.Container)
 	}
 	if tc.ExecutionMode.KubernetesClusterExecutionMode.Overrides != "" {
-		obj, err := applyOverrides(job, tc.ExecutionMode.KubernetesClusterExecutionMode.Overrides)
+		obj, err := k8sjobutil.ApplyOverrides(job, tc.ExecutionMode.KubernetesClusterExecutionMode.Overrides)
 		if err != nil {
 			return err
 		}
@@ -234,7 +224,35 @@ func (v *Verifier) createAndRunJob(ctx context.Context, tc latest.VerifyTestCase
 			return errors.Wrap(err, "creating verify job in cluster")
 		}
 	}
-	w, err := clientset.BatchV1().Jobs(job.Namespace).Watch(context.TODO(),
+
+	var timeoutDuration *time.Duration = nil
+	if tc.Config.Timeout != nil {
+		timeoutDuration = util.Ptr(time.Second * time.Duration(*tc.Config.Timeout))
+	}
+
+	var execErr error
+	execCh := make(chan error)
+	go func() {
+		execCh <- v.watchJob(ctx, clientset, job, tc)
+		close(execCh)
+	}()
+
+	select {
+	case execErr = <-execCh:
+	case <-v.timeout(timeoutDuration):
+		execErr = errors.New(fmt.Sprintf("%q running k8s job timed out after : %v", tc.Name, *timeoutDuration))
+		v.logger.CancelJobLogger(job.Name)
+		if err := k8sjobutil.ForceJobDelete(ctx, job.Name, clientset.BatchV1().Jobs(job.Namespace), &v.kubectl); err != nil {
+			execErr = errors.Wrap(execErr, err.Error())
+		}
+		eventV2.VerifyFailed(tc.Name, execErr)
+	}
+
+	return execErr
+}
+
+func (v *Verifier) watchJob(ctx context.Context, clientset k8sclient.Interface, job *batchv1.Job, tc latest.VerifyTestCase) error {
+	w, err := clientset.BatchV1().Jobs(job.Namespace).Watch(ctx,
 		metav1.ListOptions{FieldSelector: fmt.Sprintf("metadata.name=%s", job.Name)})
 	if err != nil {
 		eventV2.VerifyFailed(tc.Name, err)
@@ -242,7 +260,7 @@ func (v *Verifier) createAndRunJob(ctx context.Context, tc latest.VerifyTestCase
 	}
 	defer w.Stop()
 
-	w, err = clientset.CoreV1().Pods(job.Namespace).Watch(context.TODO(),
+	w, err = clientset.CoreV1().Pods(job.Namespace).Watch(ctx,
 		metav1.ListOptions{
 			LabelSelector: labels.Set(map[string]string{"job-name": job.Name}).String(),
 		})
@@ -263,6 +281,11 @@ func (v *Verifier) createAndRunJob(ctx context.Context, tc latest.VerifyTestCase
 			if pod.Status.Phase == corev1.PodFailed {
 				podErr = errors.New(fmt.Sprintf("%q running job %q errored during run", tc.Name, job.Name))
 				break
+			}
+
+			if err := k8sjobutil.CheckIfPullImgErr(pod, job.Name); err != nil {
+				v.logger.CancelJobLogger(job.Name)
+				return err
 			}
 		}
 	}
@@ -290,12 +313,7 @@ func (v *Verifier) Cleanup(ctx context.Context, out io.Writer, dryRun bool) erro
 		// assumes the job namespace is set and not "" which is the case as createJob
 		// & createJobFromManifestPath set the namespace in the created Job
 		namespace := job.Namespace
-
-		deletePolicy := metav1.DeletePropagationForeground
-		err = clientset.BatchV1().Jobs(namespace).Delete(ctx, job.Name, metav1.DeleteOptions{
-			PropagationPolicy: &deletePolicy,
-		})
-		if err != nil {
+		if err := k8sjobutil.ForceJobDelete(ctx, job.Name, clientset.BatchV1().Jobs(namespace), &v.kubectl); err != nil {
 			// TODO(aaron-prindle): replace with actionable error
 			return errors.Wrap(err, "cleaning up deployed job")
 		}
@@ -317,33 +335,15 @@ func (v *Verifier) TrackContainerAndJobFromBuild(artifact graph.Artifact, contai
 }
 
 func (v *Verifier) createJob(jobName string, container latest.VerifyContainer) *batchv1.Job {
-	job := &batchv1.Job{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Job",
-			APIVersion: "batch/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: jobName,
-			Labels: map[string]string{
-				"skaffold.dev/run-id": v.labeller.GetRunID(),
-			},
-			Namespace: v.defaultNamespace,
-		},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: util.Ptr[int32](0),
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"skaffold.dev/run-id": v.labeller.GetRunID(),
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers:    []corev1.Container{verifyContainerToK8sContainer(container)},
-					RestartPolicy: corev1.RestartPolicyNever,
-				},
-			},
-		},
-	}
+	job := k8sjobutil.GetGenericJob()
+	job.ObjectMeta.Name = jobName
+	job.Namespace = v.defaultNamespace
+	job.Spec.Template.Spec.Containers = []corev1.Container{verifyContainerToK8sContainer(container)}
+	job.Labels["skaffold.dev/run-id"] = v.labeller.GetRunID()
+	job.Spec.Template.Labels["skaffold.dev/run-id"] = v.labeller.GetRunID()
+	job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
+	job.Spec.BackoffLimit = util.Ptr[int32](0)
+
 	return job
 }
 
@@ -368,43 +368,12 @@ func verifyContainerToK8sContainer(vc latest.VerifyContainer) corev1.Container {
 }
 
 func (v *Verifier) createJobFromManifestPath(jobName string, container latest.VerifyContainer, manifestPath string) (*batchv1.Job, error) {
-	var job *batchv1.Job
-
-	b, err := ioutil.ReadFile(manifestPath)
-
+	job, err := k8sjobutil.LoadFromPath(manifestPath)
 	if err != nil {
 		return nil, err
-	}
-
-	// Create a runtime.Decoder from the Codecs field within
-	// k8s.io/client-go that's pre-loaded with the schemas for all
-	// the standard Kubernetes resource types.
-	decoder := scheme.Codecs.UniversalDeserializer()
-
-	resourceYAML := string(b)
-	if len(resourceYAML) == 0 {
-		return nil, fmt.Errorf("empty file found at manifestPath: %s, verify that the manifestPath is correct", manifestPath)
-	}
-	// - obj is the API object (e.g., Job)
-	// - groupVersionKind is a generic object that allows
-	//   detecting the API type we are dealing with, for
-	//   accurate type casting later.
-	obj, groupVersionKind, err := decoder.Decode(
-		[]byte(resourceYAML),
-		nil,
-		nil)
-	if err != nil {
-		return nil, err
-	}
-	// Only process Jobs for now
-	if groupVersionKind.Group == "batch" && groupVersionKind.Version == "v1" && groupVersionKind.Kind == "Job" {
-		job = obj.(*batchv1.Job)
 	}
 
 	job.Name = jobName
-	if job.Labels == nil {
-		job.Labels = map[string]string{}
-	}
 	job.Labels["skaffold.dev/run-id"] = v.labeller.GetRunID()
 	job.Spec.Template.Spec.Containers = []corev1.Container{verifyContainerToK8sContainer(container)}
 	job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
@@ -431,24 +400,10 @@ func (v *Verifier) appendEnvIntoJob(envMap map[string]string, job *batchv1.Job) 
 	}
 }
 
-func applyOverrides(obj runtime.Object, overrides string) (runtime.Object, error) {
-	codec := runtime.NewCodec(scheme.DefaultJSONEncoder(), scheme.Codecs.UniversalDecoder(scheme.Scheme.PrioritizedVersionsAllGroups()...))
-	return merge(codec, obj, overrides)
-}
-
-func merge(codec runtime.Codec, dst runtime.Object, fragment string) (runtime.Object, error) {
-	// encode dst into versioned json and apply fragment directly too it
-	target, err := runtime.Encode(codec, dst)
-	if err != nil {
-		return nil, err
+func (v *Verifier) timeout(duration *time.Duration) <-chan time.Time {
+	if duration != nil {
+		return time.After(*duration)
 	}
-	patched, err := jsonpatch.MergePatch(target, []byte(fragment))
-	if err != nil {
-		return nil, err
-	}
-	out, err := runtime.Decode(codec, patched)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	// Nil channel will never emit a value, so it will simulate an endless timeout.
+	return nil
 }

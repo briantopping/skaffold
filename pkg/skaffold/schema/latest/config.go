@@ -26,7 +26,7 @@ import (
 )
 
 // !!! WARNING !!! This config version is already released, please DO NOT MODIFY the structs in this file.
-const Version string = "skaffold/v4beta5"
+const Version string = "skaffold/v4beta6"
 
 // NewSkaffoldConfig creates a SkaffoldConfig
 func NewSkaffoldConfig() util.VersionedConfig {
@@ -634,10 +634,18 @@ type KubernetesClusterVerifier struct {
 type VerifyTestCase struct {
 	// Name is the name descriptor for the verify test.
 	Name string `yaml:"name" yamltags:"required"`
+	// Config describes general configuration for the verify test.
+	Config VerifyConfig `yaml:",inline"`
 	// Container is the container information for the verify test.
 	Container VerifyContainer `yaml:"container" yamltags:"required"`
 	// ExecutionMode is the execution mode used to execute the verify test case.
 	ExecutionMode VerifyExecutionModeConfig `yaml:"executionMode,omitempty"`
+}
+
+// VerifyConfig describes general configuration options available for a verify test.
+type VerifyConfig struct {
+	// Timeout indicates the max time (in seconds) that the verify test is allowed to run.
+	Timeout *int `yaml:"timeout,omitempty"`
 }
 
 // VerifyContainer is a list of tests to run on images that Skaffold builds.

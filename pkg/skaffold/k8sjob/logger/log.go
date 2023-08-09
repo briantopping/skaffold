@@ -49,6 +49,10 @@ type Logger struct {
 	childThreadEmitLogs AtomicBool
 	muted               int32
 	kubeContext         string
+	// Map to store cancel functions per each job.
+	jobLoggerCancelers sync.Map
+	// Function to cancel any in progress logger through a context.
+	cancelThreadsLoggers func()
 }
 
 type AtomicBool struct{ flag int32 }
@@ -120,6 +124,10 @@ func (l *Logger) Start(ctx context.Context, out io.Writer) error {
 		return nil
 	}
 	l.out = out
+
+	allCancelCtx, allCancel := context.WithCancel(ctx)
+	l.cancelThreadsLoggers = allCancel
+
 	go func() {
 		for {
 			select {
@@ -127,7 +135,9 @@ func (l *Logger) Start(ctx context.Context, out io.Writer) error {
 				return
 			case info := <-l.tracker.Notifier():
 				id, namespace := info[0], info[1]
-				go l.streamLogsFromKubernetesJob(ctx, id, namespace, false)
+				jobLogCancelCtx, jobLogCancel := context.WithCancel(allCancelCtx)
+				l.jobLoggerCancelers.Store(id, jobLogCancel)
+				go l.streamLogsFromKubernetesJob(jobLogCancelCtx, id, namespace, false)
 			}
 		}
 	}()
@@ -156,7 +166,7 @@ func (l *Logger) streamLogsFromKubernetesJob(ctx context.Context, id, namespace 
 				}
 			}
 			var podName string
-			w, err := clientset.CoreV1().Pods(namespace).Watch(context.TODO(),
+			w, err := clientset.CoreV1().Pods(namespace).Watch(ctx,
 				metav1.ListOptions{
 					LabelSelector: labels.Set(map[string]string{"job-name": id, "skaffold.dev/run-id": l.labeller.GetRunID()}).String(),
 				})
@@ -191,7 +201,7 @@ func (l *Logger) streamLogsFromKubernetesJob(ctx context.Context, id, namespace 
 
 			// Stream the logs
 			req := clientset.CoreV1().Pods(namespace).GetLogs(podName, podLogOptions)
-			podLogs, err := req.Stream(context.TODO())
+			podLogs, err := req.Stream(ctx)
 			if err != nil {
 				return false, nil
 			}
@@ -219,6 +229,8 @@ func (l *Logger) Stop() {
 		return
 	}
 	l.childThreadEmitLogs.Set(false)
+	l.cancelThreadsLoggers()
+	l.wg.Wait()
 
 	l.hadLogsOutput.Range(func(key, value interface{}) bool {
 		if !value.(bool) {
@@ -261,4 +273,12 @@ func (l *Logger) IsMuted() bool {
 
 func (l *Logger) SetSince(time.Time) {
 	// we always create a new Job on Verify, so this is a noop.
+}
+
+func (l *Logger) CancelJobLogger(jobID string) {
+	if cancelJobLogger, found := l.jobLoggerCancelers.Load(jobID); found {
+		cancelJobLogger.(context.CancelFunc)()
+	}
+	// We mark the job to prevent it from being drained during logger stop.
+	l.hadLogsOutput.Store(jobID, true)
 }

@@ -434,13 +434,81 @@ deploy:
 			shouldErr:     true,
 			cmpOptions:    []cmp.Option{testutil.YamlObj(t)},
 		},
+		{
+			description:   "v2beta29 helm deploy hook patches",
+			targetVersion: latest.Version,
+			inputYaml: `apiVersion: skaffold/v2beta29
+kind: Config
+build:
+  artifacts:
+  - image: skaffold-helm
+deploy:
+  helm:
+    releases:
+    - name: skaffold-helm
+      chartPath: charts
+    hooks:
+      before:
+        - host:
+            command: ["bash", "-c", "echo before!"]
+      after:
+        - host:
+            command: ["bash", "-c", "echo after!"]
+
+profiles:
+  - name: p1
+    patches:
+      - op: replace
+        path: /deploy/helm/hooks/before/0/host/command
+        value: ["bash", "-c", "echo before-from-profile!"]
+      - op: replace
+        path: /deploy/helm/hooks/after/0/host/command
+        value: ["bash", "-c", "echo after-from-profile!"]
+`,
+			output: fmt.Sprintf(`apiVersion: %s
+kind: Config
+build:
+  artifacts:
+  - image: skaffold-helm
+
+manifests:
+  helm:
+    releases:
+      - name: skaffold-helm
+        chartPath: charts
+
+deploy:
+  helm:
+    releases:
+    - name: skaffold-helm
+      chartPath: charts
+    hooks:
+      before:
+        - host:
+            command: ["bash", "-c", "echo before!"]
+      after:
+        - host:
+            command: ["bash", "-c", "echo after!"]
+
+profiles:
+  - name: p1
+    patches:
+      - op: replace
+        path: /deploy/helm/hooks/before/0/host/command
+        value: ["bash", "-c", "echo before-from-profile!"]
+      - op: replace
+        path: /deploy/helm/hooks/after/0/host/command
+        value: ["bash", "-c", "echo after-from-profile!"]
+`, latest.Version),
+			cmpOptions: []cmp.Option{testutil.YamlObj(t)},
+		},
 	}
 	for _, test := range tests {
 		testutil.Run(t, test.description, func(t *testutil.T) {
 			cfgFile := t.TempFile("config", []byte(test.inputYaml))
 
 			var b bytes.Buffer
-			err := fix(&b, cfgFile, "", test.targetVersion)
+			err := fix(&b, cfgFile, "", test.targetVersion, false)
 			t.CheckErrorAndDeepEqual(test.shouldErr, err, test.output, b.String(), test.cmpOptions)
 		})
 	}
@@ -485,11 +553,74 @@ deploy:
 		cfgFile := t.TempFile("config", []byte(inputYaml))
 
 		var b bytes.Buffer
-		err := fix(&b, cfgFile, cfgFile, latest.Version)
+		err := fix(&b, cfgFile, cfgFile, latest.Version, true)
 
 		output, _ := os.ReadFile(cfgFile)
 
 		t.CheckNoError(err)
 		t.CheckDeepEqual(expectedOutput, string(output), testutil.YamlObj(t.T))
+
+		original, err := os.ReadFile(fmt.Sprintf("%s.v2", cfgFile))
+		t.CheckNoError(err)
+		t.CheckDeepEqual(inputYaml, string(original), testutil.YamlObj(t.T))
+	})
+}
+
+func TestFixToSymlinkedFileOverwrite(t *testing.T) {
+	inputYaml := `apiVersion: skaffold/v1alpha4
+kind: Config
+build:
+  artifacts:
+  - image: docker/image
+    docker:
+      dockerfile: dockerfile.test
+test:
+- image: docker/image
+  structureTests:
+  - ./test/*
+deploy:
+  kubectl:
+    manifests:
+    - k8s/deployment.yaml
+`
+	expectedOutput := fmt.Sprintf(`apiVersion: %s
+kind: Config
+build:
+  artifacts:
+  - image: docker/image
+    docker:
+      dockerfile: dockerfile.test
+test:
+- image: docker/image
+  structureTests:
+  - ./test/*
+manifests:
+  rawYaml:
+  - k8s/deployment.yaml
+deploy:
+  kubectl: {}
+`, latest.Version)
+
+	testutil.Run(t, "", func(t *testutil.T) {
+		tempDir := t.NewTempDir()
+		tempDir.Write("config", inputYaml)
+		tempDir.Symlink("config", "symlinks/link_to_config")
+		tempDir.Symlink("symlinks/link_to_config", "symlinks/link_to_symlink")
+		symlinkFile := tempDir.Path("symlinks/link_to_symlink")
+		cfgFile := tempDir.Path("config")
+		var b bytes.Buffer
+		err := fix(&b, symlinkFile, symlinkFile, latest.Version, true)
+
+		output, _ := os.ReadFile(symlinkFile)
+		t.CheckNoError(err)
+		t.CheckDeepEqual(expectedOutput, string(output), testutil.YamlObj(t.T))
+
+		output, _ = os.ReadFile(cfgFile)
+		t.CheckNoError(err)
+		t.CheckDeepEqual(expectedOutput, string(output), testutil.YamlObj(t.T))
+
+		backup, err := os.ReadFile(tempDir.Path("symlinks/link_to_symlink.v2"))
+		t.CheckNoError(err)
+		t.CheckDeepEqual(inputYaml, string(backup), testutil.YamlObj(t.T))
 	})
 }

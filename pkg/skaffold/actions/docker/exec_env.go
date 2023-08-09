@@ -68,7 +68,7 @@ var NewExecEnv = newExecEnv
 
 func newExecEnv(ctx context.Context, cfg dockerutil.Config, labeller *label.DefaultLabeller, resources []*latest.PortForwardResource, network string, envMap map[string]string, acs []latest.Action) (*ExecEnv, error) {
 	tracker := tracker.NewContainerTracker()
-	l, err := logger.NewLogger(ctx, tracker, cfg)
+	l, err := logger.NewLogger(ctx, tracker, cfg, false)
 	if err != nil {
 		return nil, err
 	}
@@ -106,9 +106,9 @@ func newExecEnv(ctx context.Context, cfg dockerutil.Config, labeller *label.Defa
 	}, nil
 }
 
-func (e ExecEnv) PrepareActions(ctx context.Context, out io.Writer, allbuilds []graph.Artifact, acsNames []string) ([]actions.Action, error) {
+func (e ExecEnv) PrepareActions(ctx context.Context, out io.Writer, allbuilds, _ []graph.Artifact, acsNames []string) ([]actions.Action, error) {
 	if e.shouldCreateNetwork {
-		if err := e.client.NetworkCreate(ctx, e.network); err != nil {
+		if err := e.client.NetworkCreate(ctx, e.network, nil); err != nil {
 			return nil, fmt.Errorf("creating skaffold network %s: %w", e.network, err)
 		}
 	}

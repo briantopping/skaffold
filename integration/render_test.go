@@ -365,8 +365,112 @@ spec:
         pathType: ImplementationSpecific
 `,
 		}, {
-			description:      "Template with Release.namespace set from skaffold.yaml file",
-			dir:              "testdata/helm-namespace",
+			description:      "Template with Release.namespace set from skaffold.yaml file deploy.helm.releases.namespace",
+			dir:              "testdata/helm-deploy-namespace",
+			withoutBuildJSON: true,
+			expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: skaffold-helm
+    skaffold.dev/run-id: phony-run-id
+  name: skaffold-helm
+  namespace: helm-namespace
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+        skaffold.dev/run-id: phony-run-id
+    spec:
+      containers:
+      - image: skaffold-helm:latest
+        name: skaffold-helm
+`,
+		}, {
+			description:      "Template with Release.namespace set from skaffold.yaml file manifests.helm.releases.namespace",
+			dir:              "testdata/helm-manifests-namespace",
+			withoutBuildJSON: true,
+			expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: skaffold-helm
+    skaffold.dev/run-id: phony-run-id
+  name: skaffold-helm
+  namespace: helm-namespace
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+        skaffold.dev/run-id: phony-run-id
+    spec:
+      containers:
+      - image: skaffold-helm:latest
+        name: skaffold-helm
+`,
+		}, {
+			description:      "Template with Release.namespace set from skaffold.yaml file manifests.helm.releases.namespace and deploy.helm.releases.namespace",
+			dir:              "testdata/helm-manifests-and-deploy-namespace",
+			withoutBuildJSON: true,
+			expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: skaffold-helm
+    skaffold.dev/run-id: phony-run-id
+  name: skaffold-helm
+  namespace: helm-namespace-1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+        skaffold.dev/run-id: phony-run-id
+    spec:
+      containers:
+      - image: skaffold-helm:latest
+        name: skaffold-helm
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: skaffold-helm
+    skaffold.dev/run-id: phony-run-id
+  name: skaffold-helm
+  namespace: helm-namespace-2
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+        skaffold.dev/run-id: phony-run-id
+    spec:
+      containers:
+      - image: skaffold-helm:latest
+        name: skaffold-helm
+`,
+		}, {
+			description:      "Template with Release.namespace set from skaffold.yaml file deploy.helm.releases.namespace - v1 skaffold schema",
+			dir:              "testdata/helm-deploy-namespace-v1-schema",
 			withoutBuildJSON: true,
 			expectedOut: `apiVersion: apps/v1
 kind: Deployment
@@ -1107,13 +1211,14 @@ spec:
 	}
 }
 
-func TestRenderWithTransformer(t *testing.T) {
+func TestRenderParameterization(t *testing.T) {
 	tests := []struct {
-		description string
-		args        []string
-		config      string
-		input       map[string]string // file path => content
-		expectedOut string
+		description        string
+		args               []string
+		WithBuildArtifacts bool
+		config             string
+		input              map[string]string // file path => content
+		expectedOut        string
 	}{
 		{
 			description: "kubectl set manifest label with apply-setters",
@@ -1150,41 +1255,6 @@ spec:
   - name: getting-started
     image: skaffold-example
 `,
-		},
-		{
-			description: "kubectl set manifest label with --set flag overrides transform in manifest",
-			args:        []string{"--offline=true", "--set", "app1=from-command-line"},
-			config: `apiVersion: skaffold/v4beta2
-kind: Config
-manifests:
-  rawYaml:
-  - k8s-pod.yaml
-  transform:
-    - name: apply-setters
-      configMap:
-        - "app1:from-apply-setters-1"
-`,
-			input: map[string]string{
-				"k8s-pod.yaml": `apiVersion: v1
-kind: Pod
-metadata:
-  name: getting-started
-  labels:
-    a: hhhh # kpt-set: ${app1}
-  spec:
-    containers:
-      - name: getting-started
-        image: skaffold-example`},
-			expectedOut: `apiVersion: v1
-kind: Pod
-metadata:
-  name: getting-started
-  labels:
-    a: from-command-line
-  spec:
-    containers:
-      - name: getting-started
-        image: skaffold-example`,
 		},
 		{description: "kustomize set annotation with set-annotations transformer",
 			args: []string{"--offline=true"},
@@ -1274,8 +1344,8 @@ manifests:
   kustomize:
     paths:
     - overlays/dev
-`, input: map[string]string{
-				"base/kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1beta1
+`, input: map[string]string{"base/kustomization.yaml": `
+apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
@@ -1285,7 +1355,7 @@ kind: Deployment
 metadata:
   name: skaffold-kustomize
   labels:
-    app: skaffold-kustomize # kpt-set: ${app1}
+    app: skaffold-kustomize # from-param: ${app1}
 spec:
   selector:
     matchLabels:
@@ -1314,7 +1384,7 @@ kind: Deployment
 metadata:
   name: skaffold-kustomize
   labels:
-    env: dev # kpt-set: ${env2}
+    env: dev # from-param: ${env2}
 `}, expectedOut: `
 apiVersion: apps/v1
 kind: Deployment
@@ -1345,10 +1415,6 @@ kind: Config
 manifests:
   rawYaml:
     - k8s-pod.yaml
-  transform:
-    - name: apply-setters
-      configMap:
-        - "app1:from-apply-setters-1"
 `,
 			input: map[string]string{
 				"k8s-pod.yaml": `
@@ -1357,7 +1423,7 @@ kind: Pod
 metadata:
   name: getting-started
   labels:
-    a: hhhh # kpt-set: ${app1}
+    a: hhhh # from-param: ${app1}
 spec:
   containers:
     - name: getting-started
@@ -1396,8 +1462,8 @@ kind: Pod
 metadata:
   name: getting-started
   labels:
-    a: hhhh # kpt-set: ${app1}
-    b: hhhh # kpt-set: ${app2}
+    a: hhhh # from-param: ${app1}
+    b: hhhh # from-param: ${app2}
 spec:
   containers:
     - name: getting-started
@@ -1436,7 +1502,7 @@ kind: Pod
 metadata:
   name: getting-started
   labels:
-    a: hhhh # kpt-set: ${app1}
+    a: hhhh # from-param: ${app1}
 spec:
   containers:
     - name: getting-started
@@ -1453,6 +1519,278 @@ spec:
     - name: getting-started
       image: skaffold-example
 `},
+		{
+			description: "test set param with helm native template(replicaCount)",
+			args:        []string{"--offline=true", "--set", "replicaCount=5"},
+			config: `
+apiVersion: skaffold/v4beta2
+kind: Config
+manifests:
+  helm:
+    releases:
+      - name: skaffold-helm
+        chartPath: charts
+        namespace: helm-namespace
+`,
+			input: map[string]string{
+				"charts/templates/deployments.yaml": `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  replicas: {{ .Values.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: {{ .Values.image }}
+`,
+				"charts/Chart.yaml": `
+apiVersion: v1
+description: Skaffold example with Helm
+name: skaffold-helm
+version: 0.1.0
+`,
+				"charts/values.yaml": `
+replicaCount: 2
+image: skaffold-helm:latest
+`,
+			}, expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skaffold-helm
+  namespace: helm-namespace
+  labels:
+    app: skaffold-helm
+spec:
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  replicas: 5
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+    spec:
+      containers:
+      - name: skaffold-helm
+        image: skaffold-helm:latest
+`},
+		{
+			description:        "test set param with helm #from-param overrides native template(replicaCount) is comment templated field provided",
+			args:               []string{"--offline=true", "--set", "replicaCount=5", "--set", "count=6"},
+			WithBuildArtifacts: true,
+			config: `
+apiVersion: skaffold/v4beta2
+kind: Config
+manifests:
+  helm:
+    releases:
+      - name: skaffold-helm
+        chartPath: charts
+        namespace: helm-namespace
+`,
+			input: map[string]string{
+				"charts/templates/deployments.yaml": `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  replicas: {{ .Values.replicaCount }} # from-param: ${count}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: {{ .Values.image }}
+`,
+				"charts/Chart.yaml": `
+apiVersion: v1
+description: Skaffold example with Helm
+name: skaffold-helm
+version: 0.1.0
+`,
+				"charts/values.yaml": `
+replicaCount: 2
+image: skaffold-helm:latest
+`,
+			}, expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skaffold-helm
+  namespace: helm-namespace
+  labels:
+    app: skaffold-helm
+spec:
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  replicas: 6
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+    spec:
+      containers:
+      - name: skaffold-helm
+        image: skaffold-helm:latest
+`},
+		{
+			description:        "test set param with helm #from-param has no effect on native template(replicaCount) when comment templated field value not provided",
+			args:               []string{"--offline=true", "--set", "replicaCount=5"},
+			WithBuildArtifacts: true,
+			config: `
+apiVersion: skaffold/v4beta2
+kind: Config
+manifests:
+  helm:
+    releases:
+      - name: skaffold-helm
+        chartPath: charts
+        namespace: helm-namespace
+`,
+			input: map[string]string{
+				"charts/templates/deployments.yaml": `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  replicas: {{ .Values.replicaCount }} # from-param: ${count}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: {{ .Values.image }}
+`,
+				"charts/Chart.yaml": `
+apiVersion: v1
+description: Skaffold example with Helm
+name: skaffold-helm
+version: 0.1.0
+`,
+				"charts/values.yaml": `
+replicaCount: 2
+image: skaffold-helm:latest
+`,
+			}, expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skaffold-helm
+  namespace: helm-namespace
+  labels:
+    app: skaffold-helm
+spec:
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  replicas: 5
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+    spec:
+      containers:
+      - name: skaffold-helm
+        image: skaffold-helm:latest
+`},
+		{
+			description:        "test set param with helm #from-param, values are provided through file",
+			args:               []string{"--offline=true", "--set-value-file", "values.env"},
+			WithBuildArtifacts: true,
+			config: `
+apiVersion: skaffold/v4beta2
+kind: Config
+manifests:
+  helm:
+    releases:
+      - name: skaffold-helm
+        chartPath: charts
+        namespace: helm-namespace
+`,
+			input: map[string]string{
+				"charts/templates/deployments.yaml": `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  replicas: {{ .Values.replicaCount }} # from-param: ${count}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: {{ .Values.image }}
+`,
+				"charts/Chart.yaml": `
+apiVersion: v1
+description: Skaffold example with Helm
+name: skaffold-helm
+version: 0.1.0
+`,
+				"charts/values.yaml": `
+replicaCount: 2
+image: skaffold-helm:latest
+`,
+				"values.env": `count=3`,
+			}, expectedOut: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skaffold-helm
+  namespace: helm-namespace
+  labels:
+    app: skaffold-helm
+spec:
+  selector:
+    matchLabels:
+      app: skaffold-helm
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: skaffold-helm
+    spec:
+      containers:
+      - name: skaffold-helm
+        image: skaffold-helm:latest
+`},
 	}
 
 	for _, test := range tests {
@@ -1463,6 +1801,11 @@ spec:
 
 			for filePath, content := range test.input {
 				tmpDir.Write(filePath, content)
+			}
+
+			if test.WithBuildArtifacts {
+				dir, _ := os.Getwd()
+				test.args = append(test.args, "--build-artifacts="+filepath.Join(dir, "testdata/render/build-output.json"))
 			}
 
 			tmpDir.Chdir()
